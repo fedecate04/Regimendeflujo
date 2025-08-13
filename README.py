@@ -98,7 +98,7 @@ def control_variable_suggestion(regime: str, T_c: float | None, WAT_c: float | N
 # =========================
 # Portada UTN (logo fijo ARRIBA)
 # =========================
-logo_path = Path("logoutn")
+logo_path = Path(logoutn)
 if logo_path.exists():
     st.image(str(logo_path), width=160)
 st.markdown("<h2 style='text-align:center;margin-bottom:0;'>UNIVERSIDAD TECNOLÓGICA NACIONAL</h2>", unsafe_allow_html=True)
