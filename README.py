@@ -95,20 +95,58 @@ def control_variable_suggestion(regime: str, T_c: float | None, WAT_c: float | N
         return ("Temperatura", "Alejar la operación de la WAT reduce μ y riesgo de cera; favorece atomización.")
     return ("Presión", "Priorizar estabilidad de ΔP; Temperatura secundaria salvo proximidad a WAT.")
 
-# =========================
-# Portada UTN (logo fijo ARRIBA)
-# =========================
-logo_path = Path(logoutn)
-if logo_path.exists():
-    st.image(str(logo_path), width=160)
-st.markdown("<h2 style='text-align:center;margin-bottom:0;'>UNIVERSIDAD TECNOLÓGICA NACIONAL</h2>", unsafe_allow_html=True)
-st.markdown("<div style='text-align:center;'>Cátedra: Flujos Multifásicos</div>", unsafe_allow_html=True)
+# ===== Portada UTN con logo (robusta) =====
+from pathlib import Path
+
+def find_logo():
+    """
+    Busca el logo 'logoutn' en la raíz del repo admitiendo varias extensiones.
+    Devuelve la ruta como string o None si no existe.
+    """
+    # nombres candidatos en raíz (podés agregar más rutas si lo guardas en /assets, /img, etc.)
+    candidates = [
+        Path("logoutn"),                   # por si lo subiste sin extensión (poco común)
+        Path("logoutn.png"),
+        Path("logoutn.jpg"),
+        Path("logoutn.jpeg"),
+        Path("logoutn.svg"),
+        Path("logoutn.webp"),
+    ]
+    for p in candidates:
+        if p.exists():
+            return str(p)
+    return None
+
+logo_path = find_logo()
+
+# Encabezado institucional
+if logo_path:
+    # centrar el logo usando columnas
+    c1, c2, c3 = st.columns([1, 2, 1])
+    with c2:
+        st.image(logo_path, use_column_width=False, width=180)  # ajustá el ancho si querés
+else:
+    st.warning("No se encontró el archivo de logo 'logoutn.(png|jpg|svg|...)' en la raíz del repo.")
+
 st.markdown(
-    "<div style='text-align:center; margin-top:6px;'><b>Profesor:</b> Ezequiel Arturo Krumrick<br>"
-    "<b>Alumnos:</b> Catereniuc Federico / Rioseco Juan Manuel</div>",
+    "<h2 style='text-align:center;margin:6px 0 0 0;'>UNIVERSIDAD TECNOLÓGICA NACIONAL</h2>",
+    unsafe_allow_html=True
+)
+st.markdown(
+    "<div style='text-align:center; font-size:16px;'>Cátedra: Flujos Multifásicos</div>",
+    unsafe_allow_html=True
+)
+st.markdown(
+    """
+    <div style='text-align:center; margin-top:6px;'>
+      <b>Profesor:</b> Ezequiel Arturo Krumrick<br>
+      <b>Alumnos:</b> Catereniuc Federico / Rioseco Juan Manuel
+    </div>
+    """,
     unsafe_allow_html=True
 )
 st.markdown("---")
+
 
 # =========================
 # Presentación didáctica
