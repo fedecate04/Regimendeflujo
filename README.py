@@ -1,59 +1,43 @@
 import math
-from io import StringIO
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import streamlit as st
-from pathlib import Path
 
-# ==============
+# =========================
 # Config general
-# ==============
-st.set_page_config(page_title="UTN | Mandhane - Regímenes de Flujo", page_icon="🌊", layout="wide")
-
-# --------------------------
-# Utilidad: cargar el logo
-# --------------------------
-def load_logo():
-    root = Path(".")
-    for fname in ["logoutn.png", "logoutn.jpg", "logoutn.jpeg", "logoutn.svg"]:
-        p = root / fname
-        if p.exists():
-            return str(p)
-    return None  # si no está, no rompe
+# =========================
+st.set_page_config(page_title="UTN | Regímenes de Flujo (Mandhane)", page_icon="🌊", layout="wide")
 
 # =========================
 # Utilidades de ingeniería
 # =========================
-def area_circular(D_m):
+def area_circular(D_m: float) -> float:
     return math.pi * (D_m**2) / 4.0
 
-def convertir_Q(value, unit):
-    # Admite m3/h y m3/s -> devuelve m3/s
-    if pd.isna(value):
-        return np.nan
+def convertir_Q(value, unit: str) -> float:
+    """Convierte Q a m3/s desde m3/h o m3/s."""
+    if pd.isna(value): return np.nan
     try:
         v = float(value)
-    except:
+    except Exception:
         return np.nan
     return v/3600.0 if unit == "m³/h" else v
 
-def superficial_velocity(Q_ms, D_m):
-    if np.isnan(Q_ms) or np.isnan(D_m) or D_m <= 0:
-        return np.nan
-    A = area_circular(D_m)
-    return Q_ms / A
+def superficial_velocity(Q_ms: float, D_m: float) -> float:
+    if np.isnan(Q_ms) or np.isnan(D_m) or D_m <= 0: return np.nan
+    return Q_ms / area_circular(D_m)
 
 # =========================
-# Clasificador Mandhane "didáctico"
+# Clasificador "didáctico" Mandhane
+# (aprox. aire-agua horizontal; útil para práctica)
 # =========================
-def classify_mandhane(vsl, vsg):
-    if np.isnan(vsl) or np.isnan(vsg):
-        return "—"
-    vsl_c = max(vsl, 1e-6)
-    vsg_c = max(vsg, 1e-6)
-    L = math.log10(vsl_c)
-    G = math.log10(vsg_c)
+def classify_mandhane(vsl: float, vsg: float) -> str:
+    if np.isnan(vsl) or np.isnan(vsg): return "—"
+    vsl_c = max(vsl, 1e-6); vsg_c = max(vsg, 1e-6)
+    L = math.log10(vsl_c); G = math.log10(vsg_c)
 
     if G < -0.3 and L < -0.3:
         return "Estratificado"
@@ -65,87 +49,80 @@ def classify_mandhane(vsl, vsg):
         return "Disperso"
     return "Intermitente / Slug" if G >= L else "Estratificado"
 
-# =========================================
+# =========================
 # Sugerencias de validación de campo
-# =========================================
-def validation_suggestions(regime):
-    regime = (regime or "").lower()
-    if "estrat" in regime:
+# =========================
+def validation_suggestions(regime: str):
+    r = (regime or "").lower()
+    if "estrat" in r:
         return [
-            "Perfil de presión (ΔP/L) estable y bajo; registrar varianza de dP.",
-            "Medición de holdup/altura de lámina (gamma o capacitancia).",
-            "Inspección visual/video: ondas interfaciales gravitacionales.",
+            "ΔP/L estable (baja varianza) con trending.",
+            "Holdup/altura de lámina (capacitancia o gamma).",
+            "Inspección visual/video (ondas interfaciales).",
         ]
-    if "slug" in regime or "intermit" in regime:
+    if "slug" in r or "intermit" in r:
         return [
-            "Oscilaciones periódicas de presión (FFT/frecuencia de slugs).",
-            "Sondas de impedancia para longitud/frecuencia de tapones.",
-            "Acelerometría/vibración de línea correlacionada con pasaje de slugs.",
+            "Oscilaciones periódicas de presión (FFT).",
+            "Sondas de impedancia (frecuencia/longitud de tapones).",
+            "Acelerometría o vibración de línea correlacionada.",
         ]
-    if "anular" in regime:
+    if "anular" in r:
         return [
-            "Espesor de película en pared (anillos de conductancia/filmómetro).",
-            "Fracción de arrastre (entrainment) y caída de presión elevada.",
-            "Sondas ópticas/capacitivas circumferenciales para humectación superior.",
+            "Espesor de película (anillos de conductancia/filmómetro).",
+            "Medir entrainment y alta caída de presión.",
+            "Sondas circumferenciales (humectación superior).",
         ]
-    if "dispers" in regime or "burbu" in regime:
+    if "dispers" in r or "burbu" in r:
         return [
-            "Fracción de vacío (void fraction) por impedancia/capacitancia.",
-            "Distribución de tamaños de burbuja por imagenología si aplica.",
-            "Perfil de presión con baja varianza temporal.",
+            "Fracción de vacío por impedancia/capacitancia.",
+            "Distribución de tamaños de burbuja (imagenología si aplica).",
+            "ΔP/L con baja varianza.",
         ]
-    return [
-        "ΔP/L con análisis de varianza/FFT.",
-        "Alguna técnica de holdup (capacitancia, gamma).",
-        "Observación visual/filmación si la línea lo permite.",
-    ]
+    return ["ΔP/L + varianza", "Holdup", "Observación visual"]
 
 # =========================
-# Gráfico tipo Mandhane
+# Sugerencia de VARIABLE a controlar (P o T) para CRUDO
 # =========================
-def draw_mandhane_style(points):
-    fig, ax = plt.subplots(figsize=(7,6))
+def control_variable_suggestion(regime: str, T_c: float | None, WAT_c: float | None) -> tuple[str, str]:
+    """
+    Devuelve ('Presión' o 'Temperatura', explicación breve) orientado a petróleo crudo.
+    Criterio simple:
+      - Slug/intermitente: priorizar Presión (back-pressure) para amortiguar slugging.
+      - Anular: priorizar Temperatura (viscosidad/interfacial) y vigilar ΔP alto.
+      - Estratificado: Presión (estabilidad) + si T < WAT, Temperatura por riesgo de cera.
+      - Disperso/burbujeante: Temperatura si T≈WAT (reducir μ y evitar cera), si no Presión secundaria.
+    """
+    r = (regime or "").lower()
 
-    vmin, vmax = 1e-2, 30
-    ax.set_xscale('log'); ax.set_yscale('log')
-    ax.set_xlim([vmin, vmax]); ax.set_ylim([vmin, vmax])
-    ax.set_xlabel(r"$V_{sl}$  (m/s)")
-    ax.set_ylabel(r"$V_{sg}$  (m/s)")
-    ax.set_title("Mapa tipo Mandhane (horizontal) — aproximado para práctica")
+    def near_or_below_wat(T, WAT):
+        if T is None or WAT is None: return False
+        return T <= WAT + 2.0  # margen didáctico
 
-    strat_poly = np.array([[1e-2,1e-2],[2e-1,1e-2],[2e-1,5e-1],[1e-2,5e-1]])
-    ax.fill(strat_poly[:,0], strat_poly[:,1], alpha=0.08, label="Estratificado")
-
-    slug_poly = np.array([[5e-2,5e-2],[2e-1,2e0],[8e-1,1e0],[3e-1,2e-2],[5e-2,3e-2]])
-    ax.fill(slug_poly[:,0], slug_poly[:,1], alpha=0.08, label="Intermitente/Slug")
-
-    ann_poly = np.array([[1e-2,3e0],[3e-1,3e0],[3e-1,3e1],[1e-2,3e1]])
-    ax.fill(ann_poly[:,0], ann_poly[:,1], alpha=0.08, label="Anular")
-
-    disp_poly = np.array([[2e-1,1e-2],[3e1,1e-2],[3e1,3e1],[2e-1,3e1]])
-    ax.fill(disp_poly[:,0], disp_poly[:,1], alpha=0.08, label="Disperso")
-
-    for i, p in enumerate(points, start=1):
-        vsl, vsg, tag, regime = p
-        if np.isnan(vsl) or np.isnan(vsg): 
-            continue
-        ax.scatter(vsl, vsg, s=60)
-        ax.annotate(f"{tag}: {regime}", xy=(vsl, vsg), xytext=(5,5),
-                    textcoords="offset points", fontsize=9)
-
-    ax.grid(True, which='both', alpha=0.25)
-    ax.legend(loc="lower right", fontsize=9)
-    return fig
+    if "slug" in r or "intermit" in r:
+        return ("Presión",
+                "Aplicar control de back‑pressure / válvula de salida o estabilización de caudal para amortiguar la formación de slugs y reducir la varianza de ΔP.")
+    if "anular" in r:
+        return ("Temperatura",
+                "Elevar T reduce μ del crudo y la tensión superficial, estabilizando la película y disminuyendo ΔP; mantener T bien por encima de la WAT para evitar cera/ensuciamiento.")
+    if "estrat" in r:
+        if near_or_below_wat(T_c, WAT_c):
+            return ("Temperatura",
+                    "Operar por encima de la WAT para bajar viscosidad y evitar deposición de cera; luego ajustar back‑pressure para mantener ΔP estable.")
+        return ("Presión",
+                "Mantener ΔP estable y bajo mediante control de back‑pressure; monitorear holdup para evitar inundación.")
+    # Disperso / burbujeante
+    if near_or_below_wat(T_c, WAT_c):
+        return ("Temperatura",
+                "Alejarse de la WAT reduce μ y el riesgo de cera; favorece atomización estable y menor ΔP.")
+    return ("Presión",
+            "Con patrones dispersos, priorizar estabilidad de ΔP y evitar oscilaciones; la temperatura queda como variable secundaria salvo proximidad a WAT.")
 
 # =========================
-# PORTADA UTN
+# Portada Institucional (logo fijo ARRIBA)
 # =========================
-logo_pos = st.radio("Posición del logo", ["Arriba del título", "Debajo del título"], index=0)
-logo_path = load_logo()
-
-if logo_pos == "Arriba del título" and logo_path:
-    st.image(logo_path, width=160)
-
+logo_path = Path("logoutn.png")
+if logo_path.exists():
+    st.image(str(logo_path), width=160)
 st.markdown(
     "<h2 style='text-align:center;margin-bottom:0;'>UNIVERSIDAD TECNOLÓGICA NACIONAL</h2>",
     unsafe_allow_html=True
@@ -154,17 +131,13 @@ st.markdown(
     "<div style='text-align:center;'>Cátedra: Flujos Multifásicos</div>",
     unsafe_allow_html=True
 )
-
-if logo_pos == "Debajo del título" and logo_path:
-    st.image(logo_path, width=160)
-
 st.markdown(
     """
-    <div style='text-align:center; margin-top:6px;'>
-    <b>Profesor:</b> Ezequiel Arturo Krumrick<br>
-    <b>Alumnos:</b> Catereniuc Federico / Rioseco Juan Manuel
-    </div>
-    """,
+<div style='text-align:center; margin-top:6px;'>
+<b>Profesor:</b> Ezequiel Arturo Krumrick<br>
+<b>Alumnos:</b> Catereniuc Federico / Rioseco Juan Manuel
+</div>
+""",
     unsafe_allow_html=True
 )
 st.markdown("---")
@@ -172,30 +145,29 @@ st.markdown("---")
 # =========================
 # Presentación didáctica
 # =========================
-with st.expander("📚 ¿Qué hace esta aplicación y por qué es importante? (didáctico)", expanded=True):
+with st.expander("📚 Qué hace la app y por qué es importante (crudo)", expanded=True):
     st.markdown(
         """
-**Objetivo.** A partir de tres pares de caudales \\((Q_L, Q_G)\\) y el diámetro \\(D\\), la app calcula las
-**velocidades superficiales** \\(j_L = V_{sl}\\) y \\(j_G = V_{sg}\\), ubica los puntos en un **mapa tipo Mandhane**
-(ejes log–log de \\(V_{sl}\\) vs \\(V_{sg}\\)) y sugiere el **régimen de flujo** (estratificado, intermitente/slug,
-anular o disperso). Además, propone **mediciones de campo** para **validar** la selección.
+La app calcula **velocidades superficiales** \\(j_L, j_G\\) a partir de \\((Q_L, Q_G, D)\\), 
+ubica los puntos en un **mapa tipo Mandhane** y sugiere el **régimen** esperado. 
+Incluye recomendaciones de **qué variable controlar** (Presión o Temperatura) en contextos de **petróleo crudo**, 
+considerando la **WAT** si la indicás.
 
-**Importancia ingeniería.**
-Conocer \\(j_L\\) y \\(j_G\\) y el régimen de flujo permite:
-- **Estimar la caída de presión** y dimensionar equipos/compresores/bombas.
-- **Predecir fenómenos operativos** (slugs, arrastre de gotas, humectación de pared).
-- **Definir estrategias de medición** (ΔP, holdup, sondas de impedancia/capacitancia) para confirmar el patrón real.
-> Nota: El clasificador es **didáctico** (aire–agua horizontal). Para proyectos reales puede reemplazarse por límites
-digitizados de Mandhane, modelos mecanísticos (Taitel–Dukler) o correlaciones (Beggs–Brill), y agregar propiedades de fluido.
+**Relevancia:** conocer el régimen permite anticipar **ΔP**, **slugging**, **arrastre**, **humectación**, y **riesgo de cera**. 
+Esto guía decisiones de **operación** (back‑pressure, calentamiento, aislamiento) y **medición** (ΔP, holdup, impedancia).
         """
     )
 
-# ==============
-# Sidebar inputs
-# ==============
-st.sidebar.header("Parámetros")
+# =========================
+# Sidebar: Parámetros de ducto y de crudo
+# =========================
+st.sidebar.header("Parámetros del ducto")
 D = st.sidebar.number_input("Diámetro interno D [m]", min_value=0.001, value=0.10, step=0.001, format="%.3f")
 unit = st.sidebar.selectbox("Unidades de Q", ["m³/h", "m³/s"], index=0)
+
+st.sidebar.header("Propiedades de crudo (para recomendaciones)")
+T_c = st.sidebar.number_input("Temperatura de operación T [°C]", value=25.0, step=0.5)
+WAT_c = st.sidebar.number_input("WAT (Wax Appearance Temperature) [°C]", value=20.0, step=0.5)
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("**Carga por CSV (opcional)**")
@@ -204,7 +176,7 @@ st.sidebar.download_button("Descargar plantilla CSV", csv_example, file_name="pl
 uploaded = st.sidebar.file_uploader("Subí CSV (tag, QL, QG) con las mismas unidades elegidas", type=["csv"])
 
 # =========================
-# Datos de entrada
+# 1) Datos de entrada
 # =========================
 st.header("1) Datos de entrada")
 st.markdown("Completá hasta **tres casos** (o subí CSV). Elegí unidades en la barra lateral.")
@@ -238,9 +210,9 @@ df = st.data_editor(
 )
 
 # =========================
-# Cálculos
+# 2) Cálculos y clasificación
 # =========================
-st.header("2) Cálculo de velocidades superficiales")
+st.header("2) Cálculo de velocidades superficiales y régimen")
 rows = []
 for _, row in df.iterrows():
     tag = str(row.get("tag", "Caso"))
@@ -249,13 +221,16 @@ for _, row in df.iterrows():
     vsl = superficial_velocity(QL_u, D)  # m/s
     vsg = superficial_velocity(QG_u, D)  # m/s
     regime = classify_mandhane(vsl, vsg)
+    ctrl_var, ctrl_note = control_variable_suggestion(regime, T_c, WAT_c)
     rows.append({
         "tag": tag,
         "QL [m³/s]": QL_u,
         "QG [m³/s]": QG_u,
         "jL = Vsl [m/s]": vsl,
         "jG = Vsg [m/s]": vsg,
-        "Régimen (estimado)": regime
+        "Régimen (estimado)": regime,
+        "Control prioritario": ctrl_var,
+        "Justificación control": ctrl_note
     })
 
 res = pd.DataFrame(rows)
@@ -266,28 +241,64 @@ st.dataframe(res.style.format({
     "jG = Vsg [m/s]": "{:.4f}",
 }))
 
-csv_out = res.to_csv(index=False).encode("utf-8")
-st.download_button("⬇️ Descargar resultados (CSV)", csv_out, file_name="resultados_mandhane.csv", mime="text/csv")
+st.download_button("⬇️ Descargar resultados (CSV)",
+                   res.to_csv(index=False).encode("utf-8"),
+                   file_name="resultados_mandhane_crudo.csv",
+                   mime="text/csv")
 
 # =========================
-# Gráfico
+# 3) Mapa: puntos sobre imagen 'regimenes.png'
 # =========================
-st.header("3) Mapa tipo Mandhane (log–log)")
-points = [(r["jL = Vsl [m/s]"], r["jG = Vsg [m/s]"], r["tag"], r["Régimen (estimado)"]) for _, r in res.iterrows()]
-fig = draw_mandhane_style(points)
-st.pyplot(fig, use_container_width=True)
+st.header("3) Mapa de Mandhane con imagen de fondo")
+
+def draw_points_over_image(points, img_path: str):
+    # Extensión típica del gráfico Mandhane de tu imagen (ajustable si hiciera falta)
+    x_min, x_max = 1e-2, 2e1   # VSG [m/s]
+    y_min, y_max = 1e-2, 3e0   # VSL [m/s]
+    fig, ax = plt.subplots(figsize=(7,6))
+    # Mostrar imagen de fondo
+    img = plt.imread(img_path)
+    ax.set_xscale('log'); ax.set_yscale('log')
+    ax.set_xlim([x_min, x_max]); ax.set_ylim([y_min, y_max])
+    ax.imshow(img, extent=[x_min, x_max, y_min, y_max],
+              origin='lower', aspect='auto', zorder=0, alpha=0.95)
+    ax.set_xlabel(r"$V_{SG}$ [m/s]")
+    ax.set_ylabel(r"$V_{SL}$ [m/s]")
+    ax.set_title("Ubicación sobre mapa de régimen (imagen de referencia)")
+    # Puntos
+    for vsl, vsg, tag, regime in points:
+        if np.isnan(vsl) or np.isnan(vsg): 
+            continue
+        ax.scatter(vsg, vsl, s=60, zorder=5)  # ojo: x=VSG, y=VSL
+        ax.annotate(f"{tag}: {regime}", xy=(vsg, vsl), xytext=(5,5),
+                    textcoords="offset points", fontsize=9, zorder=6)
+    ax.grid(False)
+    return fig
+
+img_path = Path("regimenes.png")
+if not img_path.exists():
+    st.warning("No se encontró 'regimenes.png' en la raíz del repo. Subilo para ver el fondo.")
+else:
+    points = [(r["jL = Vsl [m/s]"], r["jG = Vsg [m/s]"], r["tag"], r["Régimen (estimado)"]) 
+              for _, r in res.iterrows()]
+    fig = draw_points_over_image(points, str(img_path))
+    st.pyplot(fig, use_container_width=True)
 
 # =========================
-# Validación sugerida
+# 4) Validación + Variable de control sugerida
 # =========================
-st.header("4) Validación de campo sugerida")
+st.header("4) Validación de campo y variable de control prioritaria (crudo)")
 for _, r in res.iterrows():
     st.subheader(f"🔎 {r['tag']}: {r['Régimen (estimado)']}")
-    tips = validation_suggestions(r["Régimen (estimado)"])
-    st.markdown("\n".join([f"- {t}" for t in tips]))
+    st.markdown(f"**Variable prioritaria a controlar:** {r['Control prioritario']}")
+    st.markdown(f"_Motivo:_ {r['Justificación control']}")
+    st.markdown("**Mediciones sugeridas para validar:**")
+    for tip in validation_suggestions(r["Régimen (estimado)"]):
+        st.markdown(f"- {tip}")
 
 st.markdown("---")
 st.markdown(
-    "**Notas:** Clasificador aproximado para práctica. Para uso profesional podemos implementar límites de Mandhane "
-    "digitalizados, Taitel–Dukler, o correlaciones con propiedades reales del sistema."
+    "Nota: Clasificador didáctico. Para proyectos con crudo real podemos incorporar límites digitalizados, "
+    "Taitel–Dukler y correcciones por propiedades (ρ, μ, σ) y por WAT para mover fronteras de transición."
 )
+
