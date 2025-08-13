@@ -252,37 +252,43 @@ st.download_button("⬇️ Descargar resultados (CSV)",
 st.header("3) Mapa de Mandhane con imagen de fondo")
 
 def draw_points_over_image(points, img_path: str):
-    # Extensión típica del gráfico Mandhane de tu imagen (ajustable si hiciera falta)
-    x_min, x_max = 1e-2, 2e1   # VSG [m/s]
-    y_min, y_max = 1e-2, 3e0   # VSL [m/s]
+    # Límites reales del Mandhane de tu imagen
+    x_min, x_max = 1e-2, 2e1   # VSG
+    y_min, y_max = 1e-2, 3e0   # VSL
+    
     fig, ax = plt.subplots(figsize=(7,6))
-    # Mostrar imagen de fondo
+    
+    # Leer imagen y mostrarla en coordenadas log–log
     img = plt.imread(img_path)
-    ax.set_xscale('log'); ax.set_yscale('log')
-    ax.set_xlim([x_min, x_max]); ax.set_ylim([y_min, y_max])
-    ax.imshow(img, extent=[x_min, x_max, y_min, y_max],
-              origin='lower', aspect='auto', zorder=0, alpha=0.95)
+    ax.set_xscale('log')
+    ax.set_yscale('log')
+    ax.set_xlim([x_min, x_max])
+    ax.set_ylim([y_min, y_max])
+    
+    ax.imshow(
+        img,
+        extent=[x_min, x_max, y_min, y_max],
+        aspect='auto',
+        origin='upper',   # usa 'lower' si quieres invertir vertical
+        zorder=0
+    )
+    
+    # Etiquetas
     ax.set_xlabel(r"$V_{SG}$ [m/s]")
     ax.set_ylabel(r"$V_{SL}$ [m/s]")
-    ax.set_title("Ubicación sobre mapa de régimen (imagen de referencia)")
+    ax.set_title("Ubicación sobre mapa Mandhane")
+    
     # Puntos
     for vsl, vsg, tag, regime in points:
         if np.isnan(vsl) or np.isnan(vsg): 
             continue
-        ax.scatter(vsg, vsl, s=60, zorder=5)  # ojo: x=VSG, y=VSL
+        ax.scatter(vsg, vsl, s=60, zorder=5)
         ax.annotate(f"{tag}: {regime}", xy=(vsg, vsl), xytext=(5,5),
                     textcoords="offset points", fontsize=9, zorder=6)
+    
     ax.grid(False)
     return fig
 
-img_path = Path("regimenes.png")
-if not img_path.exists():
-    st.warning("No se encontró 'regimenes.png' en la raíz del repo. Subilo para ver el fondo.")
-else:
-    points = [(r["jL = Vsl [m/s]"], r["jG = Vsg [m/s]"], r["tag"], r["Régimen (estimado)"]) 
-              for _, r in res.iterrows()]
-    fig = draw_points_over_image(points, str(img_path))
-    st.pyplot(fig, use_container_width=True)
 
 # =========================
 # 4) Validación + Variable de control sugerida
