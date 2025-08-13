@@ -103,9 +103,8 @@ def find_logo():
     Busca el logo 'logoutn' en la raíz del repo admitiendo varias extensiones.
     Devuelve la ruta como string o None si no existe.
     """
-    # nombres candidatos en raíz (podés agregar más rutas si lo guardas en /assets, /img, etc.)
     candidates = [
-        Path("logoutn"),                   # por si lo subiste sin extensión (poco común)
+        Path("logoutn"),
         Path("logoutn.png"),
         Path("logoutn.jpg"),
         Path("logoutn.jpeg"),
@@ -121,10 +120,10 @@ logo_path = find_logo()
 
 # Encabezado institucional
 if logo_path:
-    # centrar el logo usando columnas
+    # Centrar el logo usando columnas
     c1, c2, c3 = st.columns([1, 2, 1])
     with c2:
-        st.image(logo_path, use_column_width=False, width=180)  # ajustá el ancho si querés
+        st.image(logo_path, use_container_width=False, width=180)  # Ajusta el ancho aquí
 else:
     st.warning("No se encontró el archivo de logo 'logoutn.(png|jpg|svg|...)' en la raíz del repo.")
 
