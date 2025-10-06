@@ -6,11 +6,20 @@ import matplotlib.pyplot as plt
 from io import BytesIO
 from datetime import datetime
 
-# PDF (reportlab)
-from reportlab.lib.pagesizes import A4
-from reportlab.pdfgen import canvas
-from reportlab.lib.utils import ImageReader
-from reportlab.lib.units import cm
+# ====== PDF backends (reportlab -> preferido; fpdf2 -> fallback) ======
+REPORT_BACKEND = None
+try:
+    from reportlab.lib.pagesizes import A4
+    from reportlab.pdfgen import canvas
+    from reportlab.lib.utils import ImageReader
+    from reportlab.lib.units import cm
+    REPORT_BACKEND = "reportlab"
+except Exception:
+    try:
+        from fpdf import FPDF  # pip install fpdf2
+        REPORT_BACKEND = "fpdf"
+    except Exception:
+        REPORT_BACKEND = None
 
 # --------- Modelos físicos básicos ---------
 def churchill_f(Re, eps_over_D):
@@ -21,7 +30,7 @@ def churchill_f(Re, eps_over_D):
     return f  # Darcy
 
 def rho_gas_ideal(rho_ref, P, T, P_ref, T_ref):
-    # z = 1 (gas ideal); permite T variable; isotermo si T es constante
+    # z = 1 (gas ideal); isotermo si T se mantiene constante
     return rho_ref * (P/P_ref) * (T_ref/T)
 
 def mixture_props(rhoL, muL, rhoG, muG, HL, a=0.6, b=0.4):
@@ -150,69 +159,100 @@ def make_pressure_plot(df):
     fig.tight_layout()
     return fig
 
-# ----- Generación del PDF -----
+# ----- Generación del PDF (usa reportlab o fpdf2 según disponibilidad) -----
 def build_pdf(df, fig, meta):
-    """
-    meta: dict con keys:
-      'logo_path', 'titulo', 'catedra', 'profesor', 'anio', 'pin_bar', 'pout_bar', 'dptot_bar', 'ntramos'
-    """
-    buffer = BytesIO()
-    c = canvas.Canvas(buffer, pagesize=A4)
-    W, H = A4
+    if REPORT_BACKEND == "reportlab":
+        buffer = BytesIO()
+        c = canvas.Canvas(buffer, pagesize=A4)
+        W, H = A4
 
-    y = H - 2*cm
+        y = H - 2*cm
+        # Logo
+        if meta.get("logo_path"):
+            try:
+                c.drawImage(ImageReader(meta["logo_path"]), 1.5*cm, y-2.2*cm,
+                            width=4.0*cm, height=2.2*cm, preserveAspectRatio=True, mask='auto')
+            except Exception:
+                pass
 
-    # Logo
-    if meta.get("logo_path", None):
+        # Encabezado
+        c.setFont("Helvetica-Bold", 14); c.drawString(6.0*cm, y, meta.get("titulo",""))
+        c.setFont("Helvetica", 11)
+        c.drawString(6.0*cm, y-0.8*cm, f"Cátedra: {meta.get('catedra','')}")
+        c.drawString(6.0*cm, y-1.5*cm, f"Profesor: {meta.get('profesor','')}")
+        c.drawString(6.0*cm, y-2.2*cm, f"Año: {meta.get('anio','')}")
+        c.drawRightString(W-1.5*cm, y-2.2*cm, datetime.now().strftime("Fecha y hora: %Y-%m-%d %H:%M"))
+        c.line(1.5*cm, y-2.5*cm, W-1.5*cm, y-2.5*cm)
+
+        # Resumen
+        y2 = y - 3.2*cm
+        c.setFont("Helvetica-Bold", 12); c.drawString(1.5*cm, y2, "Resumen del cálculo")
+        c.setFont("Helvetica", 11)
+        c.drawString(1.5*cm, y2-0.7*cm, f"Tramos calculados: {meta['ntramos']}")
+        c.drawString(1.5*cm, y2-1.3*cm, f"P_in: {meta['pin_bar']:.2f} bar")
+        c.drawString(1.5*cm, y2-1.9*cm, f"P_out: {meta['pout_bar']:.2f} bar")
+        c.drawString(1.5*cm, y2-2.5*cm, f"Δp total: {meta['dptot_bar']:.2f} bar")
+
+        # Gráfico
+        img_buf = BytesIO()
+        fig.savefig(img_buf, format="png", dpi=160, bbox_inches="tight"); img_buf.seek(0)
+        c.drawImage(ImageReader(img_buf), 1.5*cm, 3.0*cm, width=W-3.0*cm, height=8.0*cm,
+                    preserveAspectRatio=True, mask='auto')
+
+        c.setFont("Helvetica-Oblique", 9)
+        c.drawRightString(W-1.5*cm, 1.5*cm, "Generado automáticamente por la app Streamlit — Flujos Multifásicos (GL)")
+        c.showPage(); c.save(); buffer.seek(0)
+        return buffer.read()
+
+    elif REPORT_BACKEND == "fpdf":
+        pdf = FPDF(format='A4', unit='mm')
+        pdf.add_page()
+
+        # Logo
         try:
-            c.drawImage(ImageReader(meta["logo_path"]), 1.5*cm, y-2.2*cm, width=4.0*cm, height=2.2*cm, preserveAspectRatio=True, mask='auto')
+            pdf.image(meta.get("logo_path",""), x=10, y=10, w=35)
         except Exception:
             pass
 
-    # Encabezado
-    c.setFont("Helvetica-Bold", 14)
-    c.drawString(6.0*cm, y, meta.get("titulo", ""))
-    c.setFont("Helvetica", 11)
-    c.drawString(6.0*cm, y-0.8*cm, f"Cátedra: {meta.get('catedra','')}")
-    c.drawString(6.0*cm, y-1.5*cm, f"Profesor: {meta.get('profesor','')}")
-    c.drawString(6.0*cm, y-2.2*cm, f"Año: {meta.get('anio','')}")
-    c.drawRightString(W-1.5*cm, y-2.2*cm, datetime.now().strftime("Fecha y hora: %Y-%m-%d %H:%M"))
+        # Encabezado
+        pdf.set_xy(55, 12); pdf.set_font('Helvetica', 'B', 14)
+        pdf.multi_cell(0, 7, meta.get("titulo",""))
+        pdf.set_xy(55, 26); pdf.set_font('Helvetica', '', 11)
+        pdf.multi_cell(0, 6,
+            f"Cátedra: {meta.get('catedra','')}\n"
+            f"Profesor: {meta.get('profesor','')}\n"
+            f"Año: {meta.get('anio','')}\n"
+            f"Fecha y hora: {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+        )
 
-    # Línea separadora
-    c.line(1.5*cm, y-2.5*cm, W-1.5*cm, y-2.5*cm)
+        # Resumen
+        pdf.set_xy(10, 60); pdf.set_font('Helvetica', 'B', 12)
+        pdf.cell(0, 7, "Resumen del cálculo", ln=1)
+        pdf.set_font('Helvetica', '', 11)
+        pdf.cell(0, 6, f"Tramos calculados: {meta['ntramos']}", ln=1)
+        pdf.cell(0, 6, f"P_in: {meta['pin_bar']:.2f} bar", ln=1)
+        pdf.cell(0, 6, f"P_out: {meta['pout_bar']:.2f} bar", ln=1)
+        pdf.cell(0, 6, f"Δp total: {meta['dptot_bar']:.2f} bar", ln=1)
 
-    # Resumen
-    y2 = y - 3.2*cm
-    c.setFont("Helvetica-Bold", 12)
-    c.drawString(1.5*cm, y2, "Resumen del cálculo")
-    c.setFont("Helvetica", 11)
-    c.drawString(1.5*cm, y2-0.7*cm, f"Tramos calculados: {meta['ntramos']}")
-    c.drawString(1.5*cm, y2-1.3*cm, f"P_in: {meta['pin_bar']:.2f} bar")
-    c.drawString(1.5*cm, y2-1.9*cm, f"P_out: {meta['pout_bar']:.2f} bar")
-    c.drawString(1.5*cm, y2-2.5*cm, f"Δp total: {meta['dptot_bar']:.2f} bar")
+        # Gráfico
+        img_buf = BytesIO()
+        fig.savefig(img_buf, format='png', dpi=160, bbox_inches='tight'); img_buf.seek(0)
+        pdf.image(img_buf, x=10, y=105, w=190)
 
-    # Insertar gráfico
-    img_buf = BytesIO()
-    fig.savefig(img_buf, format="png", dpi=160, bbox_inches="tight")
-    img_buf.seek(0)
-    img = ImageReader(img_buf)
-    c.drawImage(img, 1.5*cm, 3.0*cm, width=W-3.0*cm, height=8.0*cm, preserveAspectRatio=True, mask='auto')
+        pdf.set_y(285); pdf.set_font('Helvetica', 'I', 9)
+        pdf.cell(0, 6, "Generado automáticamente por la app Streamlit — Flujos Multifásicos (GL)", align='R')
 
-    # Pie
-    c.setFont("Helvetica-Oblique", 9)
-    c.drawRightString(W-1.5*cm, 1.5*cm, "Generado automáticamente por la app Streamlit — Flujos Multifásicos (GL)")
+        return pdf.output(dest='S').encode('latin1')
 
-    c.showPage()
-    c.save()
-    buffer.seek(0)
-    return buffer.read()
+    else:
+        raise RuntimeError("No hay backend de PDF disponible. Instala 'reportlab' o 'fpdf2'.")
 
 # --------- Interfaz Streamlit ---------
 def main():
     st.set_page_config(page_title="Flujos Multifásicos — Segmentación Δp (Gas-Líquido)", layout="wide")
 
-    # ----- Encabezado institucional (sin warning: use_container_width) -----
-    col_logo, col_title = st.columns([1, 3], vertical_alignment="center")
+    # ----- Encabezado institucional (sin warning) -----
+    col_logo, col_title = st.columns([1, 3])
     with col_logo:
         st.image("logoutn.png", caption=None, use_container_width=True)
     with col_title:
@@ -226,23 +266,21 @@ def main():
 
     st.title("Modelo 1D segmentado con criterios de corte (Gas–Líquido)")
 
-    # ----- Introducción / Importancia -----
+    # ----- Introducción (texto plano) -----
     st.markdown(
         """
-**Introducción.** En líneas multifásicas, la **caída de presión** impacta el **patrón de flujo**, el **holdup**, la
-**capacidad de transporte**, la **operabilidad** (slugging, inestabilidades) y el **aseguramiento de flujo** (wax/hydrates).
-Una disminución rápida de presión **expande el gas** (\\(Q_G\\propto 1/p\\)), elevando \\(v_{SG}\\) y pudiendo
-desencadenar **cambios de régimen** (estratificado → ondulado → intermitente, etc.).  
-Dimensionar por **tramos admisibles** acota la variación local de \\(p\\) y de \\(v_{SG}\\), mitigando transiciones bruscas.
+**Introducción.** En líneas multifásicas, la caída de presión impacta el patrón de flujo, el holdup,
+la capacidad de transporte, la operabilidad (slugging/inestabilidades) y el aseguramiento de flujo (cera/hidratos).
+Una disminución rápida de presión expande el gas, aumenta la velocidad superficial del gas y puede gatillar
+cambios de régimen. Acotar la variación local de presión y de velocidad superficial ayuda a evitar transiciones bruscas.
 """
     )
 
     st.markdown("**Modelo y fórmulas clave**")
     st.latex(r"g \equiv \left(\frac{dp}{dx}\right)_f = \frac{2\,f\,\rho_M\,v_M^2}{D},\quad v_M=v_{SL}+v_{SG},\quad \rho_M=H_L\rho_L+(1-H_L)\rho_G")
     st.latex(r"\Delta x_{\Delta p} = \frac{\gamma_p\,p_i}{g}")
-    st.latex(r"\text{Con gas ideal isotermo: } Q_G \propto \frac{1}{p}\Rightarrow v_{SG}\propto \frac{1}{p}")
-    st.latex(r"p(x)\approx p_i - g\,\Delta x \;\Rightarrow\; v_{SG}(x)\propto \frac{1}{p_i-g\,\Delta x}")
-    st.latex(r"\Delta x = \min\big(L_{\text{restante}},\, s\cdot\min\{\Delta x_{\Delta p},\,\Delta x_{\Delta v}\}\big),\qquad p_{i+1}=p_i-g\,\Delta x")
+    st.latex(r"\text{Gas ideal isotermo: } Q_G \propto \frac{1}{p}\Rightarrow v_{SG}\propto \frac{1}{p}")
+    st.latex(r"p_{i+1}=p_i-g\,\Delta x,\qquad \Delta x = \min\big(L_{\text{restante}},\, s\cdot\min\{\Delta x_{\Delta p},\,\Delta x_{\Delta v}\}\big)")
 
     # ----- Datos de entrada (sidebar) -----
     with st.sidebar:
@@ -294,23 +332,22 @@ Dimensionar por **tramos admisibles** acota la variación local de \\(p\\) y de 
         maxdp, maxdv, safety
     )
 
-    # ----- Qué devuelve la app (salidas) -----
+    # ----- Salidas -----
     with st.expander("¿Qué datos entrega esta aplicación? (salidas y significado)"):
         st.markdown(
             """
 - **Por tramo**: `x0, x1, dx`, `dx_p_lim`, `dx_v_lim`, `limit`, `Pin, Pout, dp, dp/p`,
   `vSG_in, vSG_out, ΔvSG/vSG`, `HL, ρG, ρM, μM, Re, f_Darcy, g`.  
-- **Global**: número de tramos, **Δp total** y gráficos \\(p(x)\\) y \\(v_{SG}(x)\\).
+- **Global**: número de tramos, Δp total y gráficos de presión vs longitud.
             """
         )
 
-    # ----- Resultados (tabla y gráficos) -----
+    # ----- Resultados (tabla y gráfico P vs L) -----
     st.subheader("Resultados por tramo")
     st.dataframe(df, use_container_width=True, height=430)
 
     fig = None
     if not df.empty:
-        # Gráfico P vs L
         fig = make_pressure_plot(df)
         st.pyplot(fig, clear_figure=False)
 
@@ -320,11 +357,12 @@ Dimensionar por **tramos admisibles** acota la variación local de \\(p\\) y de 
         pout_bar = float(df.iloc[-1]["Pout[bar]"])
         st.caption(f"Tramos: {ntramos} | Δp total ≈ {dptot_bar:.2f} bar | P_out ≈ {pout_bar:.2f} bar")
 
-        # Botón de descarga de CSV
-        st.download_button("Descargar resultados (CSV)",
-                           df.to_csv(index=False).encode(),
-                           file_name="resultados_tramos.csv",
-                           mime="text/csv")
+        st.download_button(
+            "Descargar resultados (CSV)",
+            df.to_csv(index=False).encode(),
+            file_name="resultados_tramos.csv",
+            mime="text/csv"
+        )
 
         # ----- Reporte PDF -----
         st.subheader("Exportar reporte PDF")
@@ -339,10 +377,16 @@ Dimensionar por **tramos admisibles** acota la variación local de \\(p\\) y de 
             "dptot_bar": dptot_bar,
             "ntramos": ntramos
         }
-        pdf_bytes = build_pdf(df, fig, meta)
-        st.download_button("Descargar reporte (PDF)", data=pdf_bytes,
-                           file_name=f"Reporte_FlujosMultifasicos_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf",
-                           mime="application/pdf")
+        try:
+            pdf_bytes = build_pdf(df, fig, meta)
+            st.download_button(
+                "Descargar reporte (PDF)",
+                data=pdf_bytes,
+                file_name=f"Reporte_FlujosMultifasicos_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf",
+                mime="application/pdf"
+            )
+        except Exception as e:
+            st.error(f"No se pudo generar el PDF ({e}). Instala 'reportlab' o 'fpdf2' en requirements.txt.")
 
 if __name__ == "__main__":
     main()
