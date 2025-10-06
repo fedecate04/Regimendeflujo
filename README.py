@@ -1,341 +1,204 @@
-import math
-from pathlib import Path
-
+import streamlit as st
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-import streamlit as st
 
-# =========================
-# Config general
-# =========================
-st.set_page_config(page_title="UTN | Regímenes de Flujo (Mandhane)", page_icon="🌊", layout="wide")
+# --------- Modelos físicos básicos ---------
+def churchill_f(Re, eps_over_D):
+    Re = max(Re, 1.0)
+    A = (2.457*np.log((7/Re)**0.9 + 0.27*eps_over_D))**16
+    B = (37530/Re)**16
+    f = 8 * ( (8/Re)**12 + 1/((A + B)**1.5) )**(1/12)
+    return f  # Darcy
 
-# =========================
-# Utilidades de ingeniería
-# =========================
-def area_circular(D_m: float) -> float:
-    return math.pi * (D_m**2) / 4.0
+def rho_gas_ideal(rho_ref, P, T, P_ref, T_ref):
+    # z=1, isotermo si T constante (igual usamos T por si cambia)
+    return rho_ref * (P/P_ref) * (T_ref/T)
 
-def convertir_Q(value, unit: str) -> float:
-    """Convierte Q a m3/s desde m3/h o m3/s."""
-    if pd.isna(value):
-        return np.nan
-    try:
-        v = float(value)
-    except Exception:
-        return np.nan
-    return v/3600.0 if unit == "m³/h" else v
+def mixture_props(rhoL, muL, rhoG, muG, HL, a=0.6, b=0.4):
+    rhoM = HL*rhoL + (1-HL)*rhoG
+    muM  = a*muL + b*muG
+    return rhoM, muM
 
-def superficial_velocity(Q_ms: float, D_m: float) -> float:
-    if np.isnan(Q_ms) or np.isnan(D_m) or D_m <= 0:
-        return np.nan
-    return Q_ms / area_circular(D_m)
+# ---- Hold-up según modo ----
+def holdup_from_mode(mode, QL, QG, mL, mG, rhoL, rhoG, HL_user):
+    if mode == "Ingresado":
+        return HL_user
+    elif mode == "No-slip volumétrico":
+        denom = QL + QG
+        return np.clip(QL/denom if denom>0 else 0.5, 0.01, 0.99)
+    elif mode == "Desde calidad másica (homogéneo)":
+        mtot = mL + mG
+        x = mG/mtot if mtot>0 else 0.5  # calidad másica gas
+        # fracción de gas en volumen (homogéneo)
+        alpha = (x/rhoG) / ( (x/rhoG) + ((1-x)/rhoL) )
+        HL = 1 - alpha
+        return float(np.clip(HL, 0.01, 0.99))
+    else:
+        return HL_user
 
-# =========================
-# Clasificador Mandhane (didáctico, aprox. aire-agua horizontal)
-# =========================
-def classify_mandhane(vsl: float, vsg: float) -> str:
-    if np.isnan(vsl) or np.isnan(vsg):
-        return "—"
-    vsl_c = max(vsl, 1e-6); vsg_c = max(vsg, 1e-6)
-    L = math.log10(vsl_c); G = math.log10(vsg_c)
+# ---- Límite de tamaño de tramo por criterios ----
+def step_size_limits(Pi, g, vSG_i, A, QG_i, max_dpfrac, max_dvfrac, iters=24):
+    # límite por % de caída de presión
+    dx_p = max_dpfrac * Pi / max(g, 1e-12)
 
-    # Zonas aproximadas coherentes con el mapa dibujado abajo
-    if G < -0.3 and L < -0.3:
-        return "Estratificado"
-    if (-0.6 <= L <= 0.2) and (-0.6 <= G <= 0.6) and (G >= L - 0.5):
-        return "Intermitente / Slug"
-    if G > 0.6 and (L < 0.3):
-        return "Anular / Niebla anular"
-    if L > 0.2 or (L > -0.1 and G > 0.2):
-        return "Burbujas dispersas"
-    return "Ondas / Intermedio"
+    # límite por % de cambio de vSG (compresibilidad ideal)
+    lo, hi = 0.0, max(dx_p*10, 1e-6)
+    vSG0 = vSG_i
+    for _ in range(iters):
+        mid = 0.5*(lo+hi)
+        P2 = Pi - g*mid
+        if P2 <= 1.0:  # evita negativos
+            hi = mid
+            continue
+        QG2 = QG_i * (Pi/P2)
+        vSG2 = QG2 / A
+        dvfrac = abs(vSG2 - vSG0)/max(vSG0, 1e-12)
+        if dvfrac > max_dvfrac:
+            hi = mid
+        else:
+            lo = mid
+    dx_v = lo
+    return dx_p, dx_v
 
-# =========================
-# Validación de campo
-# =========================
-def validation_suggestions(regime: str):
-    r = (regime or "").lower()
-    if "estrat" in r:
-        return ["ΔP/L estable (baja varianza) con trending.",
-                "Holdup/altura de lámina (capacitancia o gamma).",
-                "Inspección visual/video (ondas interfaciales)."]
-    if "slug" in r or "intermit" in r:
-        return ["Oscilaciones periódicas de presión (FFT).",
-                "Sondas de impedancia (frecuencia/longitud de tapones).",
-                "Acelerometría/vibración de línea correlacionada."]
-    if "anular" in r or "niebla" in r:
-        return ["Espesor de película (conductancia/filmómetro).",
-                "Medir entrainment; ΔP elevado.",
-                "Sondas circumferenciales (humectación superior)."]
-    if "burbu" in r or "dispers" in r:
-        return ["Fracción de vacío (impedancia/capacitancia).",
-                "Distribución de tamaños de burbuja (imagenología).",
-                "ΔP/L con baja varianza."]
-    return ["ΔP/L + varianza", "Holdup", "Observación visual"]
+# ---- Núcleo iterativo por tramos ----
+def solve_pipe(D, Ltot, eps, Pin, T,
+               rhoL, muL, muG, rhoG_ref, P_ref, T_ref,
+               a_mu=0.6, b_mu=0.4,
+               use_mass=False, QL=5e-4, QG0=2e-3, mL=0.0, mG=0.0,
+               HL_mode="Ingresado", HL_user=0.6,
+               max_dp_pct=3.0, max_dv_pct=5.0, safety=0.95):
 
-# =========================
-# Variable de control prioritaria (crudo)
-# =========================
-def control_variable_suggestion(regime: str, T_c: float | None, WAT_c: float | None) -> tuple[str, str]:
-    def near_or_below_wat(T, W):
-        if T is None or W is None: return False
-        return T <= W + 2.0  # margen didáctico
-    r = (regime or "").lower()
-    if "slug" in r or "intermit" in r:
-        return ("Presión", "Back‑pressure/estabilización de caudal para amortiguar slugging y reducir varianza de ΔP.")
-    if "anular" in r or "niebla" in r:
-        return ("Temperatura", "Elevar T reduce μ y σ; estabiliza la película y baja ΔP. Mantener T > WAT para evitar cera.")
-    if "estrat" in r:
-        if near_or_below_wat(T_c, WAT_c):
-            return ("Temperatura", "Operar por encima de WAT para bajar μ y evitar cera; luego ajustar back‑pressure.")
-        return ("Presión", "Mantener ΔP estable/baja con back‑pressure y controlar holdup.")
-    if near_or_below_wat(T_c, WAT_c):
-        return ("Temperatura", "Alejar la operación de la WAT reduce μ y riesgo de cera; favorece atomización.")
-    return ("Presión", "Priorizar estabilidad de ΔP; Temperatura secundaria salvo proximidad a WAT.")
+    A = np.pi*D**2/4
+    # Consistencias de entrada
+    if use_mass:
+        # si vienen másicos, construir volumétricos iniciales a Pin
+        rhoG0 = rho_gas_ideal(rhoG_ref, Pin, T, P_ref, T_ref)
+        QL = mL / max(rhoL, 1e-12)
+        QG0 = mG / max(rhoG0, 1e-12)
+    vSL = QL / A
 
-# ===== Portada UTN con logo (robusta) =====
-from pathlib import Path
+    rows, i = [], 1
+    x, Lrem, Pi = 0.0, Ltot, Pin
+    QG_i = QG0
+    vSG_i = QG_i / A
 
-def find_logo():
-    """
-    Busca el logo 'logoutn' en la raíz del repo admitiendo varias extensiones.
-    Devuelve la ruta como string o None si no existe.
-    """
-    candidates = [
-        Path("logoutn"),
-        Path("logoutn.png"),
-        Path("logoutn.jpg"),
-        Path("logoutn.jpeg"),
-        Path("logoutn.svg"),
-        Path("logoutn.webp"),
-    ]
-    for p in candidates:
-        if p.exists():
-            return str(p)
-    return None
+    while Lrem > 1e-9 and Pi > 2e3:  # corta si presión cae en exceso
+        # propiedades con la presión local
+        rhoG_i = rho_gas_ideal(rhoG_ref, Pi, T, P_ref, T_ref)
 
-logo_path = find_logo()
+        # Recalcular HL según el modo
+        HL_i = holdup_from_mode(
+            HL_mode, QL, QG_i,
+            mL if use_mass else rhoL*QL,
+            mG if use_mass else rhoG_i*QG_i,
+            rhoL, rhoG_i, HL_user
+        )
 
-# Encabezado institucional
-if logo_path:
-    # Centrar el logo usando columnas
-    c1, c2, c3 = st.columns([1, 2, 1])
-    with c2:
-        st.image(logo_path, use_container_width=False, width=180)  # Ajusta el ancho aquí
-else:
-    st.warning("No se encontró el archivo de logo 'logoutn.(png|jpg|svg|...)' en la raíz del repo.")
+        rhoM_i, muM_i = mixture_props(rhoL, muL, rhoG_i, muG, HL_i, a_mu, b_mu)
+        vM_i = vSL + vSG_i
+        Re_i = rhoM_i * vM_i * D / max(muM_i, 1e-12)
+        f_i = churchill_f(Re_i, eps/D)
+        g_i = 2 * f_i * rhoM_i * vM_i**2 / D  # Pa/m
 
-st.markdown(
-    "<h2 style='text-align:center;margin:6px 0 0 0;'>UNIVERSIDAD TECNOLÓGICA NACIONAL</h2>",
-    unsafe_allow_html=True
-)
-st.markdown(
-    "<div style='text-align:center; font-size:16px;'>Cátedra: Flujos Multifásicos</div>",
-    unsafe_allow_html=True
-)
-st.markdown(
-    """
-    <div style='text-align:center; margin-top:6px;'>
-      <b>Profesor:</b> Ezequiel Arturo Krumrick<br>
-      <b>Alumnos:</b> Catereniuc Federico / Rioseco Juan Manuel
-    </div>
-    """,
-    unsafe_allow_html=True
-)
-st.markdown("---")
+        # límites de tamaño de tramo
+        dx_p, dx_v = step_size_limits(
+            Pi, g_i, vSG_i, A, QG_i,
+            max_dp_pct/100.0, max_dv_pct/100.0
+        )
+        dx = min(Lrem, safety*min(dx_p, dx_v))
+        if dx <= 0: break
 
+        # Integración (Euler)
+        P2 = Pi - g_i*dx
 
-# =========================
-# Presentación didáctica
-# =========================
-with st.expander("📚 ¿Qué hace la app y por qué importa (crudo)?", expanded=True):
-    st.markdown(
-        """
-Calcula **j_L, j_G** a partir de \\((Q_L, Q_G, D)\\), ubica los puntos en un **mapa tipo Mandhane** generado
-programáticamente y sugiere el **régimen**. Incluye recomendación de **qué variable controlar** (Presión/Temperatura)
-considerando **WAT** del crudo.  
-El mapa y las fronteras son **aproximadas didácticas**, coherentes con literatura clásica.
-        """
+        # Actualizar caudal de gas por compresibilidad
+        QG_2 = QG_i * (Pi/max(P2, 1.0))
+        vSG_2 = QG_2 / A
+
+        # Métricas
+        dp = Pi - P2
+        dpfrac = dp / Pi
+        dvfrac = abs(vSG_2 - vSG_i) / max(vSG_i, 1e-12)
+
+        rows.append({
+            "i": i, "x0[m]": x, "x1[m]": x+dx, "dx[m]": dx,
+            "Pin[bar]": Pi/1e5, "Pout[bar]": P2/1e5, "dp[bar]": dp/1e5,
+            "dp/p[%]": 100*dpfrac, "limit": "Δp" if dx_p <= dx_v else "ΔvSG",
+            "HL[-]": HL_i, "rhoG[kg/m3]": rhoG_i, "rhoM[kg/m3]": rhoM_i,
+            "muM[mPa·s]": 1e3*muM_i, "Re[-]": Re_i, "f_Darcy[-]": f_i,
+            "g[Pa/m]": g_i, "vSL[m/s]": vSL, "vSG_in[m/s]": vSG_i, "vSG_out[m/s]": vSG_2,
+            "ΔvSG/vSG[%]": 100*dvfrac
+        })
+
+        # Avanzar tramo
+        x += dx; Lrem -= dx; i += 1
+        Pi = P2; QG_i = QG_2; vSG_i = vSG_2
+
+    return pd.DataFrame(rows)
+
+# --------- Interfaz Streamlit ---------
+def main():
+    st.set_page_config(page_title="Segmentación Δp (Gas-Líquido) — Flujos Multifásicos", layout="wide")
+    st.title("Modelo 1D segmentado con criterios de corte (GL)")
+
+    with st.sidebar:
+        st.header("Datos de entrada")
+        D   = st.number_input("Diámetro D [m]", value=0.05, min_value=0.005, step=0.005)
+        L   = st.number_input("Longitud total L [m]", value=500.0, min_value=10.0, step=10.0)
+        eps = st.number_input("Rugosidad ε [m]", value=1e-4, format="%.1e")
+        Pin = st.number_input("P_in [bar]", value=60.0, step=5.0) * 1e5
+        T   = st.number_input("Temperatura T [K]", value=318.15)
+
+        st.subheader("Caudales (elige modo)")
+        use_mass = st.radio("Modo de entrada de caudales", ["Volumétricos Q", "Másicos m·"], horizontal=True) == "Másicos m·"
+        if use_mass:
+            mL = st.number_input("m·_L [kg/s]", value=0.41, format="%.3f")
+            mG = st.number_input("m·_G [kg/s]", value=0.24, format="%.3f")
+            QL = st.number_input("Q_L [m³/s] (opcional, autocalcula)", value=5e-4, format="%.2e")
+            QG0= st.number_input("Q_G0 [m³/s] (autocalcula con Pin)", value=2e-3, format="%.2e")
+        else:
+            QL  = st.number_input("Q_L [m³/s]", value=5e-4, format="%.2e")
+            QG0 = st.number_input("Q_G en línea [m³/s]", value=2e-3, format="%.2e")
+            mL = mG = 0.0
+
+        st.subheader("Propiedades")
+        rhoL= st.number_input("ρ_L [kg/m³]", value=820.0)
+        muL = st.number_input("μ_L [Pa·s]", value=3.5e-3, format="%.2e")
+        muG = st.number_input("μ_G [Pa·s]", value=2.0e-5, format="%.1e")
+        rhoG_ref = st.number_input("ρ_G,ref [kg/m³] a P_ref,T_ref", value=120.0)
+        P_ref = st.number_input("P_ref [bar]", value=1.0) * 1e5
+        T_ref = st.number_input("T_ref [K]", value=288.15)
+
+        st.subheader("Hold-up HL")
+        HL_mode = st.selectbox("Modo HL", ["Ingresado", "No-slip volumétrico", "Desde calidad másica (homogéneo)"])
+        HL_user = st.slider("HL (si 'Ingresado')", 0.05, 0.95, 0.60)
+
+        st.subheader("Reglas y numérico")
+        maxdp = st.slider("Máx. Δp/p por tramo [%]", 0.5, 10.0, 3.0)
+        maxdv = st.slider("Máx. ΔvSG/vSG por tramo [%]", 1.0, 10.0, 5.0)
+        safety = st.slider("Factor de seguridad tamaño de tramo", 0.5, 1.0, 0.95)
+        a_mu = st.number_input("a (μ_M = a μ_L + b μ_G)", value=0.6)
+        b_mu = st.number_input("b (μ_M = a μ_L + b μ_G)", value=0.4)
+
+    df = solve_pipe(
+        D, L, eps, Pin, T,
+        rhoL, muL, muG, rhoG_ref, P_ref, T_ref,
+        a_mu, b_mu,
+        use_mass, QL, QG0, mL, mG,
+        HL_mode, HL_user,
+        maxdp, maxdv, safety
     )
 
-# =========================
-# Sidebar: Ducto & crudo
-# =========================
-st.sidebar.header("Parámetros del ducto")
-D = st.sidebar.number_input("Diámetro interno D [m]", min_value=0.001, value=0.10, step=0.001, format="%.3f")
-unit = st.sidebar.selectbox("Unidades de Q", ["m³/h", "m³/s"], index=0)
+    st.dataframe(df, use_container_width=True, height=420)
 
-st.sidebar.header("Propiedades de crudo (para recomendación)")
-T_c = st.sidebar.number_input("Temperatura de operación T [°C]", value=25.0, step=0.5)
-WAT_c = st.sidebar.number_input("WAT [°C]", value=20.0, step=0.5)
+    if not df.empty:
+        c1, c2 = st.columns(2)
+        with c1: st.line_chart(df.set_index("x1[m]")[["Pout[bar]"]], height=260)
+        with c2: st.line_chart(df.set_index("x1[m]")[["vSG_out[m/s]"]], height=260)
+        st.caption(f"Tramos: {len(df)} | Δp total ≈ {df['dp[bar]'].sum():.2f} bar")
 
-# =========================
-# 1) Datos de entrada
-# =========================
-st.header("1) Datos de entrada")
-default_df = pd.DataFrame({
-    "tag": ["Caso 1", "Caso 2", "Caso 3"],
-    "QL": [2.0, 5.0, 0.5],
-    "QG": [200.0, 50.0, 10.0],
-})
-uploaded = st.sidebar.file_uploader("Subí CSV (tag, QL, QG) con las mismas unidades elegidas", type=["csv"])
-if uploaded is not None:
-    try:
-        df_in = pd.read_csv(uploaded)
-        df_in = df_in.rename(columns={c: c.strip() for c in df_in.columns})
-        for col in ["tag", "QL", "QG"]:
-            if col not in df_in.columns:
-                st.error(f"Falta columna '{col}' en el CSV."); st.stop()
-        df = df_in.copy()
-    except Exception as e:
-        st.error(f"Error leyendo CSV: {e}")
-        df = default_df.copy()
-else:
-    df = default_df.copy()
+        st.download_button("Descargar resultados (CSV)", df.to_csv(index=False).encode(),
+                           file_name="resultados_tramos.csv", mime="text/csv")
 
-df = st.data_editor(
-    df, num_rows="fixed",
-    column_config={
-        "tag": st.column_config.TextColumn("Identificador"),
-        "QL": st.column_config.NumberColumn(f"Q_L [{unit}]"),
-        "QG": st.column_config.NumberColumn(f"Q_G [{unit}]"),
-    }
-)
-
-# =========================
-# 2) Cálculos + régimen + control recomendado
-# =========================
-st.header("2) Cálculo de velocidades superficiales y régimen")
-rows = []
-for _, row in df.iterrows():
-    tag = str(row.get("tag", "Caso"))
-    QL_u = convertir_Q(row.get("QL", np.nan), unit)  # m3/s
-    QG_u = convertir_Q(row.get("QG", np.nan), unit)  # m3/s
-    vsl = superficial_velocity(QL_u, D)  # m/s
-    vsg = superficial_velocity(QG_u, D)  # m/s
-    regime = classify_mandhane(vsl, vsg)
-    ctrl_var, ctrl_note = control_variable_suggestion(regime, T_c, WAT_c)
-    rows.append({
-        "tag": tag,
-        "QL [m³/s]": QL_u,
-        "QG [m³/s]": QG_u,
-        "jL = Vsl [m/s]": vsl,
-        "jG = Vsg [m/s]": vsg,
-        "Régimen (estimado)": regime,
-        "Control prioritario": ctrl_var,
-        "Justificación control": ctrl_note
-    })
-res = pd.DataFrame(rows)
-st.dataframe(res.style.format({
-    "QL [m³/s]": "{:.6f}",
-    "QG [m³/s]": "{:.6f}",
-    "jL = Vsl [m/s]": "{:.4f}",
-    "jG = Vsg [m/s]": "{:.4f}",
-}))
-st.download_button("⬇️ Descargar resultados (CSV)",
-                   res.to_csv(index=False).encode("utf-8"),
-                   file_name="resultados_mandhane_crudo.csv",
-                   mime="text/csv")
-
-# =========================
-# 3) Mapa tipo Mandhane (generado por código)
-# =========================
-st.header("3) Mapa tipo Mandhane (programático)")
-
-def mandhane_boundaries():
-    """
-    Genera fronteras aproximadas parecidas a la figura de referencia.
-    Devuelve dict con arrays (x=VSG, y=VSL) para distintas curvas.
-    """
-    # Rango de ejes
-    x = np.logspace(-2, 1.3, 300)  # VSG: 1e-2 → ~20
-    # Curva azul central (transición estratificado/ondas ↔ slug ↔ burbujas dispersas)
-    # Construimos por tramos para imitar la forma:
-    y1 = []
-    for xi in x:
-        if xi < 0.7:
-            # tramo izquierdo casi vertical hasta ~0.35 m/s
-            y1.append(0.35 * (xi/0.7)**(-0.02))
-        elif xi < 1.0:
-            # codo hacia abajo
-            y1.append(0.35 * (xi/0.7)**(-1.6))
-        elif xi < 3.0:
-            # tramo inclinado
-            y1.append(0.35 * (xi/1.0)**(-1.2))
-        else:
-            # baja fuerte hasta 0.01 en ~10
-            y1.append(0.12 * (xi/3.0)**(-2.2))
-    y1 = np.array(y1)
-    # Curva naranja derecha (hacia niebla anular)
-    x2 = np.logspace(0.2, 1.3, 120)  # ~1.6 a 20
-    y2 = 0.08 + 0.6*(x2/2.0)**0.8   # sube con VSG
-
-    # Líneas horizontales (como tu imagen)
-    y_h1 = 0.10  # línea púrpura (~0.1 m/s)
-    y_h2 = 0.20  # línea amarilla (~0.2 m/s)
-
-    return {
-        "x": x, "y1": y1,
-        "x2": x2, "y2": y2,
-        "y_h1": y_h1, "y_h2": y_h2
-    }
-
-def draw_mandhane(points):
-    b = mandhane_boundaries()
-
-    fig, ax = plt.subplots(figsize=(7.6, 6.2))
-    ax.set_xscale('log'); ax.set_yscale('log')
-    ax.set_xlim([1e-2, 2e1]); ax.set_ylim([1e-2, 3e0])
-
-    # Región gris tenue (muy bajos VSL/VSG)
-    ax.fill_between([1e-2, 2e1], 1e-2, 2e-2, color='0.85', alpha=0.6, linewidth=0)
-
-    # Curvas
-    ax.plot(b["x"], b["y1"], color="#1f77b4", linewidth=2.5)          # azul
-    ax.plot(b["x2"], b["y2"], color="#ff7f0e", linewidth=2.5, ls="--") # naranja
-    ax.hlines(b["y_h1"], 1e-2, 2e1, colors="#6a3d9a", linestyles="-.", linewidth=2)  # púrpura
-    ax.hlines(b["y_h2"], 1e-2, 2e1, colors="#b39b00", linestyles="--", linewidth=2)  # amarilla
-
-    # Etiquetas de zonas (posiciones elegidas para que no molesten)
-    ax.text(0.015, 0.018, "Estratificado", fontsize=10, alpha=0.8)
-    ax.text(0.05, 0.5, "Burbuja\nelongada", fontsize=10, alpha=0.8)
-    ax.text(0.8, 1.8, "Burbujas dispersas", fontsize=10, alpha=0.8)
-    ax.text(2.2, 0.8, "Tapón", fontsize=10, alpha=0.8)
-    ax.text(6.5, 0.06, "Ondas", fontsize=10, alpha=0.8)
-    ax.text(12, 0.18, "Niebla anular", fontsize=10, alpha=0.8)
-
-    # Puntos del usuario (x=VSG, y=VSL)
-    for vsl, vsg, tag, regime in points:
-        if np.isnan(vsl) or np.isnan(vsg): 
-            continue
-        ax.scatter(vsg, vsl, s=70, zorder=5)
-        ax.annotate(f"{tag}: {regime}", xy=(vsg, vsl), xytext=(5,5),
-                    textcoords="offset points", fontsize=9, zorder=6)
-
-    ax.set_xlabel(r"$V_{SG}$  [m/s]")
-    ax.set_ylabel(r"$V_{SL}$  [m/s]")
-    ax.set_title("Mapa tipo Mandhane (horizontal) — versión didáctica generada por código")
-    ax.grid(True, which='both', alpha=0.2)
-    return fig
-
-points = [(r["jL = Vsl [m/s]"], r["jG = Vsg [m/s]"], r["tag"], r["Régimen (estimado)"]) 
-          for _, r in res.iterrows()]
-fig = draw_mandhane(points)
-st.pyplot(fig, use_container_width=True)
-
-# =========================
-# 4) Validación + variable de control
-# =========================
-st.header("4) Validación de campo y variable de control prioritaria (crudo)")
-for _, r in res.iterrows():
-    st.subheader(f"🔎 {r['tag']}: {r['Régimen (estimado)']}")
-    st.markdown(f"**Variable prioritaria:** {r['Control prioritario']}")
-    st.markdown(f"_Motivo:_ {r['Justificación control']}")
-    st.markdown("**Mediciones sugeridas para validar:**")
-    for tip in validation_suggestions(r["Régimen (estimado)"]):
-        st.markdown(f"- {tip}")
-
-st.markdown("---")
-st.caption("Clasificador y fronteras aproximadas para práctica. Para uso profesional: límites digitalizados, Taitel–Dukler y correcciones por propiedades (ρ, μ, σ) y WAT.")
+if __name__ == "__main__":
+    main()
