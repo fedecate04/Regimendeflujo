@@ -2,3 +2,6 @@ streamlit>=1.36.0
 numpy>=1.26.0
 pandas>=2.2.0
 matplotlib>=3.9.0
+reportlab>=3.6.13
+fpdf2>=2.7.9
+
