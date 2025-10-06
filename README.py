@@ -1,3 +1,4 @@
+# app.py — Modelo 1D segmentado (GL) con criterios de corte y explicación didáctica
 import streamlit as st
 import numpy as np
 import pandas as pd
@@ -11,7 +12,7 @@ def churchill_f(Re, eps_over_D):
     return f  # Darcy
 
 def rho_gas_ideal(rho_ref, P, T, P_ref, T_ref):
-    # z=1, isotermo si T constante (igual usamos T por si cambia)
+    # z = 1 (gas ideal), permite T variable (isotermo si T es constante)
     return rho_ref * (P/P_ref) * (T_ref/T)
 
 def mixture_props(rhoL, muL, rhoG, muG, HL, a=0.6, b=0.4):
@@ -25,12 +26,12 @@ def holdup_from_mode(mode, QL, QG, mL, mG, rhoL, rhoG, HL_user):
         return HL_user
     elif mode == "No-slip volumétrico":
         denom = QL + QG
-        return np.clip(QL/denom if denom>0 else 0.5, 0.01, 0.99)
+        return float(np.clip(QL/denom if denom > 0 else 0.5, 0.01, 0.99))
     elif mode == "Desde calidad másica (homogéneo)":
         mtot = mL + mG
-        x = mG/mtot if mtot>0 else 0.5  # calidad másica gas
-        # fracción de gas en volumen (homogéneo)
-        alpha = (x/rhoG) / ( (x/rhoG) + ((1-x)/rhoL) )
+        x = mG/mtot if mtot > 0 else 0.5  # calidad másica gas
+        # Fracción volumétrica de gas (homogéneo)
+        alpha = (x/rhoG) / ((x/rhoG) + ((1-x)/rhoL))
         HL = 1 - alpha
         return float(np.clip(HL, 0.01, 0.99))
     else:
@@ -38,19 +39,19 @@ def holdup_from_mode(mode, QL, QG, mL, mG, rhoL, rhoG, HL_user):
 
 # ---- Límite de tamaño de tramo por criterios ----
 def step_size_limits(Pi, g, vSG_i, A, QG_i, max_dpfrac, max_dvfrac, iters=24):
-    # límite por % de caída de presión
+    # Límite por % de caída de presión: Δx_Δp = (γ_p * p_i) / g
     dx_p = max_dpfrac * Pi / max(g, 1e-12)
 
-    # límite por % de cambio de vSG (compresibilidad ideal)
+    # Límite por % de cambio de vSG (compresibilidad ideal) — bisección
     lo, hi = 0.0, max(dx_p*10, 1e-6)
     vSG0 = vSG_i
     for _ in range(iters):
         mid = 0.5*(lo+hi)
         P2 = Pi - g*mid
-        if P2 <= 1.0:  # evita negativos
+        if P2 <= 1.0:  # evita presiones no físicas
             hi = mid
             continue
-        QG2 = QG_i * (Pi/P2)
+        QG2 = QG_i * (Pi/P2)  # ideal isotermo
         vSG2 = QG2 / A
         dvfrac = abs(vSG2 - vSG0)/max(vSG0, 1e-12)
         if dvfrac > max_dvfrac:
@@ -69,12 +70,12 @@ def solve_pipe(D, Ltot, eps, Pin, T,
                max_dp_pct=3.0, max_dv_pct=5.0, safety=0.95):
 
     A = np.pi*D**2/4
-    # Consistencias de entrada
+    # Si el usuario ingresa másicos, construimos Q a Pin
     if use_mass:
-        # si vienen másicos, construir volumétricos iniciales a Pin
         rhoG0 = rho_gas_ideal(rhoG_ref, Pin, T, P_ref, T_ref)
         QL = mL / max(rhoL, 1e-12)
         QG0 = mG / max(rhoG0, 1e-12)
+
     vSL = QL / A
 
     rows, i = [], 1
@@ -82,8 +83,8 @@ def solve_pipe(D, Ltot, eps, Pin, T,
     QG_i = QG0
     vSG_i = QG_i / A
 
-    while Lrem > 1e-9 and Pi > 2e3:  # corta si presión cae en exceso
-        # propiedades con la presión local
+    while Lrem > 1e-9 and Pi > 2e3:  # corta si la presión cae demasiado
+        # Propiedades con la presión local
         rhoG_i = rho_gas_ideal(rhoG_ref, Pi, T, P_ref, T_ref)
 
         # Recalcular HL según el modo
@@ -98,32 +99,37 @@ def solve_pipe(D, Ltot, eps, Pin, T,
         vM_i = vSL + vSG_i
         Re_i = rhoM_i * vM_i * D / max(muM_i, 1e-12)
         f_i = churchill_f(Re_i, eps/D)
+
+        # Gradiente friccional (horizontal)
         g_i = 2 * f_i * rhoM_i * vM_i**2 / D  # Pa/m
 
-        # límites de tamaño de tramo
+        # Longitudes admisibles por criterio
         dx_p, dx_v = step_size_limits(
             Pi, g_i, vSG_i, A, QG_i,
             max_dp_pct/100.0, max_dv_pct/100.0
         )
-        dx = min(Lrem, safety*min(dx_p, dx_v))
-        if dx <= 0: break
 
-        # Integración (Euler)
+        # Tamaño de tramo efectivo
+        dx = min(Lrem, safety*min(dx_p, dx_v))
+        if dx <= 0:
+            break
+
+        # Integración (Euler) en el tramo
         P2 = Pi - g_i*dx
 
         # Actualizar caudal de gas por compresibilidad
         QG_2 = QG_i * (Pi/max(P2, 1.0))
         vSG_2 = QG_2 / A
 
-        # Métricas
+        # Métricas de tramo
         dp = Pi - P2
-        dpfrac = dp / Pi
+        dpfrac = dp / max(Pi, 1e-12)
         dvfrac = abs(vSG_2 - vSG_i) / max(vSG_i, 1e-12)
 
         rows.append({
             "i": i, "x0[m]": x, "x1[m]": x+dx, "dx[m]": dx,
-            "Pin[bar]": Pi/1e5, "Pout[bar]": P2/1e5, "dp[bar]": dp/1e5,
-            "dp/p[%]": 100*dpfrac, "limit": "Δp" if dx_p <= dx_v else "ΔvSG",
+            "dx_p_lim[m]": dx_p, "dx_v_lim[m]": dx_v, "limit": "Δp" if dx_p <= dx_v else "ΔvSG",
+            "Pin[bar]": Pi/1e5, "Pout[bar]": P2/1e5, "dp[bar]": dp/1e5, "dp/p[%]": 100*dpfrac,
             "HL[-]": HL_i, "rhoG[kg/m3]": rhoG_i, "rhoM[kg/m3]": rhoM_i,
             "muM[mPa·s]": 1e3*muM_i, "Re[-]": Re_i, "f_Darcy[-]": f_i,
             "g[Pa/m]": g_i, "vSL[m/s]": vSL, "vSG_in[m/s]": vSG_i, "vSG_out[m/s]": vSG_2,
@@ -138,9 +144,63 @@ def solve_pipe(D, Ltot, eps, Pin, T,
 
 # --------- Interfaz Streamlit ---------
 def main():
-    st.set_page_config(page_title="Segmentación Δp (Gas-Líquido) — Flujos Multifásicos", layout="wide")
-    st.title("Modelo 1D segmentado con criterios de corte (GL)")
+    st.set_page_config(page_title="Flujos Multifásicos — Segmentación Δp (Gas-Líquido)", layout="wide")
 
+    # ----- Encabezado institucional -----
+    col_logo, col_title = st.columns([1, 3])
+    with col_logo:
+        st.image("logoutn.png", caption=None, use_column_width=True)
+    with col_title:
+        st.markdown(
+            """
+            ### Cátedra: **FLUJOS MULTIFÁSICOS EN LA INDUSTRIA DEL PETRÓLEO**  
+            **Profesor:** Ezequiel Arturo Krumrick  
+            **Año:** 2025
+            """,
+        )
+
+    st.title("Modelo 1D segmentado con criterios de corte (Gas–Líquido)")
+
+    # ----- Introducción / Importancia -----
+    st.markdown(
+        r"""
+**Introducción.** En líneas multifásicas, la **caída de presión** impacta el **patrón de flujo**, el **holdup**, la
+**capacidad de transporte**, la **operabilidad** (slugging, inestabilidades) y el **ASEGURAMIENTO DE FLUJO** (wax/hydrates).  
+Una disminución rápida de \(p\) **expande el gas** (\(Q_G\propto 1/p\)), cambiando \(v_{SG}\) y pudiendo
+desencadenar **cambios de régimen** (estratificado → ondulado → intermitente, etc.).  
+Dimensionar por **tramos admisibles** acota la variación local de \(p\) y \(v_{SG}\), mitigando transiciones bruscas.
+
+**Modelo.** Consideramos ducto **horizontal** (sin elevación), régimen cuasi-estacionario y **gas ideal isotermo** (\(z=1\)).  
+El gradiente friccional por Darcy–Weisbach:
+\[
+g \;\equiv\; \left(\frac{dp}{dx}\right)_f = \frac{2 f\,\rho_M\,v_M^2}{D},\qquad
+v_M=v_{SL}+v_{SG},\quad \rho_M=H_L\rho_L + (1-H_L)\rho_G
+\]
+con \(f\) calculado con **Churchill** (fórmula unificada) y propiedades de mezcla simples.
+
+**Criterios de corte por tramo** (límite inicial \(p_i\)):
+\[
+\Delta x_{\Delta p}=\frac{\gamma_p\, p_i}{g},\qquad
+\Delta x_{\Delta v}=\max\big\{\Delta x:\; |\Delta v_{SG}|/v_{SG}\le \gamma_v\big\}
+\]
+donde \(\gamma_p\) (por ej. 3%) limita \(\Delta p/p\), y \(\gamma_v\) (por ej. 5%) limita la **variación relativa de \(v_{SG}\)**.
+Para gas ideal isotermo, \(Q_G \propto 1/p\Rightarrow v_{SG}\propto 1/p\), de modo que
+\[
+p(x) \approx p_i - g\,\Delta x \;\Rightarrow\; v_{SG}(x) \propto \frac{1}{p_i - g\,\Delta x}.
+\]
+La \(\Delta x_{\Delta v}\) la calculamos por **búsqueda de bisección**.  
+El tramo efectivo es:
+\[
+\boxed{\;\Delta x = \min\big(L_{\text{restante}},\; s \cdot \min\{\Delta x_{\Delta p},\Delta x_{\Delta v}\}\big)\;}
+\]
+con \(s\) **factor de seguridad** (p.ej. 0.95). Integramos \(p\) por **Euler**:
+\[
+p_{i+1} = p_i - g\,\Delta x.
+\]
+        """
+    )
+
+    # ----- Datos de entrada (sidebar) -----
     with st.sidebar:
         st.header("Datos de entrada")
         D   = st.number_input("Diámetro D [m]", value=0.05, min_value=0.005, step=0.005)
@@ -180,6 +240,7 @@ def main():
         a_mu = st.number_input("a (μ_M = a μ_L + b μ_G)", value=0.6)
         b_mu = st.number_input("b (μ_M = a μ_L + b μ_G)", value=0.4)
 
+    # ----- Resolver -----
     df = solve_pipe(
         D, L, eps, Pin, T,
         rhoL, muL, muG, rhoG_ref, P_ref, T_ref,
@@ -189,14 +250,35 @@ def main():
         maxdp, maxdv, safety
     )
 
-    st.dataframe(df, use_container_width=True, height=420)
+    # ----- Qué devuelve la app (salidas) -----
+    with st.expander("¿Qué datos entrega esta aplicación? (salidas y significado)"):
+        st.markdown(
+            """
+- **Por tramo**:  
+  - `x0, x1, dx`: posición inicial/final y longitud del tramo.  
+  - `dx_p_lim`, `dx_v_lim`: **longitudes admisibles** por criterio de **Δp/p** y **ΔvSG/vSG**.  
+  - `limit`: criterio que **limitó** el tramo efectivo.  
+  - `Pin, Pout, dp, dp/p`: presión de entrada/salida, caída y % relativo.  
+  - `vSG_in, vSG_out, ΔvSG/vSG`: velocidad superficial de gas y su variación.  
+  - `HL, ρG, ρM, μM, Re, f_Darcy, g`: propiedades y parámetros de fricción.  
+- **Global**: número de tramos, **Δp total** y gráficos \(p(x)\), \(v_{SG}(x)\).
+            """
+        )
+
+    # ----- Resultados (tabla y gráficos) -----
+    st.subheader("Resultados por tramo")
+    st.dataframe(df, use_container_width=True, height=430)
 
     if not df.empty:
         c1, c2 = st.columns(2)
-        with c1: st.line_chart(df.set_index("x1[m]")[["Pout[bar]"]], height=260)
-        with c2: st.line_chart(df.set_index("x1[m]")[["vSG_out[m/s]"]], height=260)
-        st.caption(f"Tramos: {len(df)} | Δp total ≈ {df['dp[bar]'].sum():.2f} bar")
+        with c1:
+            st.markdown("**Perfil de presión**")
+            st.line_chart(df.set_index("x1[m]")[["Pout[bar]"]], height=260)
+        with c2:
+            st.markdown("**Evolución de vSG**")
+            st.line_chart(df.set_index("x1[m]")[["vSG_out[m/s]"]], height=260)
 
+        st.caption(f"Tramos: {len(df)} | Δp total ≈ {df['dp[bar]'].sum():.2f} bar")
         st.download_button("Descargar resultados (CSV)", df.to_csv(index=False).encode(),
                            file_name="resultados_tramos.csv", mime="text/csv")
 
