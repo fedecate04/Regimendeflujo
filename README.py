@@ -1,7 +1,16 @@
-# app.py — Modelo 1D segmentado (GL) con criterios de corte y explicación didáctica
+# app.py — Modelo 1D segmentado (GL) con criterios de corte, explicación y reporte PDF
 import streamlit as st
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
+from io import BytesIO
+from datetime import datetime
+
+# PDF (reportlab)
+from reportlab.lib.pagesizes import A4
+from reportlab.pdfgen import canvas
+from reportlab.lib.utils import ImageReader
+from reportlab.lib.units import cm
 
 # --------- Modelos físicos básicos ---------
 def churchill_f(Re, eps_over_D):
@@ -12,7 +21,7 @@ def churchill_f(Re, eps_over_D):
     return f  # Darcy
 
 def rho_gas_ideal(rho_ref, P, T, P_ref, T_ref):
-    # z = 1 (gas ideal), permite T variable (isotermo si T es constante)
+    # z = 1 (gas ideal); permite T variable; isotermo si T es constante
     return rho_ref * (P/P_ref) * (T_ref/T)
 
 def mixture_props(rhoL, muL, rhoG, muG, HL, a=0.6, b=0.4):
@@ -23,19 +32,18 @@ def mixture_props(rhoL, muL, rhoG, muG, HL, a=0.6, b=0.4):
 # ---- Hold-up según modo ----
 def holdup_from_mode(mode, QL, QG, mL, mG, rhoL, rhoG, HL_user):
     if mode == "Ingresado":
-        return HL_user
+        return float(np.clip(HL_user, 0.01, 0.99))
     elif mode == "No-slip volumétrico":
         denom = QL + QG
         return float(np.clip(QL/denom if denom > 0 else 0.5, 0.01, 0.99))
     elif mode == "Desde calidad másica (homogéneo)":
         mtot = mL + mG
         x = mG/mtot if mtot > 0 else 0.5  # calidad másica gas
-        # Fracción volumétrica de gas (homogéneo)
-        alpha = (x/rhoG) / ((x/rhoG) + ((1-x)/rhoL))
+        alpha = (x/rhoG) / ((x/rhoG) + ((1-x)/rhoL))  # fracción volumétrica de gas
         HL = 1 - alpha
         return float(np.clip(HL, 0.01, 0.99))
     else:
-        return HL_user
+        return float(np.clip(HL_user, 0.01, 0.99))
 
 # ---- Límite de tamaño de tramo por criterios ----
 def step_size_limits(Pi, g, vSG_i, A, QG_i, max_dpfrac, max_dvfrac, iters=24):
@@ -84,10 +92,8 @@ def solve_pipe(D, Ltot, eps, Pin, T,
     vSG_i = QG_i / A
 
     while Lrem > 1e-9 and Pi > 2e3:  # corta si la presión cae demasiado
-        # Propiedades con la presión local
         rhoG_i = rho_gas_ideal(rhoG_ref, Pi, T, P_ref, T_ref)
 
-        # Recalcular HL según el modo
         HL_i = holdup_from_mode(
             HL_mode, QL, QG_i,
             mL if use_mass else rhoL*QL,
@@ -99,29 +105,21 @@ def solve_pipe(D, Ltot, eps, Pin, T,
         vM_i = vSL + vSG_i
         Re_i = rhoM_i * vM_i * D / max(muM_i, 1e-12)
         f_i = churchill_f(Re_i, eps/D)
-
-        # Gradiente friccional (horizontal)
         g_i = 2 * f_i * rhoM_i * vM_i**2 / D  # Pa/m
 
-        # Longitudes admisibles por criterio
         dx_p, dx_v = step_size_limits(
             Pi, g_i, vSG_i, A, QG_i,
             max_dp_pct/100.0, max_dv_pct/100.0
         )
 
-        # Tamaño de tramo efectivo
         dx = min(Lrem, safety*min(dx_p, dx_v))
         if dx <= 0:
             break
 
-        # Integración (Euler) en el tramo
         P2 = Pi - g_i*dx
-
-        # Actualizar caudal de gas por compresibilidad
         QG_2 = QG_i * (Pi/max(P2, 1.0))
         vSG_2 = QG_2 / A
 
-        # Métricas de tramo
         dp = Pi - P2
         dpfrac = dp / max(Pi, 1e-12)
         dvfrac = abs(vSG_2 - vSG_i) / max(vSG_i, 1e-12)
@@ -136,69 +134,115 @@ def solve_pipe(D, Ltot, eps, Pin, T,
             "ΔvSG/vSG[%]": 100*dvfrac
         })
 
-        # Avanzar tramo
         x += dx; Lrem -= dx; i += 1
         Pi = P2; QG_i = QG_2; vSG_i = vSG_2
 
     return pd.DataFrame(rows)
 
+# ----- Gráfico Matplotlib P vs L (para ver y para PDF) -----
+def make_pressure_plot(df):
+    fig, ax = plt.subplots(figsize=(7, 3.6), dpi=120)
+    ax.plot(df["x1[m]"], df["Pout[bar]"], lw=2, color="#0E6BA8")
+    ax.set_xlabel("Longitud L [m]")
+    ax.set_ylabel("Presión [bar]")
+    ax.grid(True, alpha=0.3)
+    ax.set_title("Perfil de presión a lo largo del ducto")
+    fig.tight_layout()
+    return fig
+
+# ----- Generación del PDF -----
+def build_pdf(df, fig, meta):
+    """
+    meta: dict con keys:
+      'logo_path', 'titulo', 'catedra', 'profesor', 'anio', 'pin_bar', 'pout_bar', 'dptot_bar', 'ntramos'
+    """
+    buffer = BytesIO()
+    c = canvas.Canvas(buffer, pagesize=A4)
+    W, H = A4
+
+    y = H - 2*cm
+
+    # Logo
+    if meta.get("logo_path", None):
+        try:
+            c.drawImage(ImageReader(meta["logo_path"]), 1.5*cm, y-2.2*cm, width=4.0*cm, height=2.2*cm, preserveAspectRatio=True, mask='auto')
+        except Exception:
+            pass
+
+    # Encabezado
+    c.setFont("Helvetica-Bold", 14)
+    c.drawString(6.0*cm, y, meta.get("titulo", ""))
+    c.setFont("Helvetica", 11)
+    c.drawString(6.0*cm, y-0.8*cm, f"Cátedra: {meta.get('catedra','')}")
+    c.drawString(6.0*cm, y-1.5*cm, f"Profesor: {meta.get('profesor','')}")
+    c.drawString(6.0*cm, y-2.2*cm, f"Año: {meta.get('anio','')}")
+    c.drawRightString(W-1.5*cm, y-2.2*cm, datetime.now().strftime("Fecha y hora: %Y-%m-%d %H:%M"))
+
+    # Línea separadora
+    c.line(1.5*cm, y-2.5*cm, W-1.5*cm, y-2.5*cm)
+
+    # Resumen
+    y2 = y - 3.2*cm
+    c.setFont("Helvetica-Bold", 12)
+    c.drawString(1.5*cm, y2, "Resumen del cálculo")
+    c.setFont("Helvetica", 11)
+    c.drawString(1.5*cm, y2-0.7*cm, f"Tramos calculados: {meta['ntramos']}")
+    c.drawString(1.5*cm, y2-1.3*cm, f"P_in: {meta['pin_bar']:.2f} bar")
+    c.drawString(1.5*cm, y2-1.9*cm, f"P_out: {meta['pout_bar']:.2f} bar")
+    c.drawString(1.5*cm, y2-2.5*cm, f"Δp total: {meta['dptot_bar']:.2f} bar")
+
+    # Insertar gráfico
+    img_buf = BytesIO()
+    fig.savefig(img_buf, format="png", dpi=160, bbox_inches="tight")
+    img_buf.seek(0)
+    img = ImageReader(img_buf)
+    c.drawImage(img, 1.5*cm, 3.0*cm, width=W-3.0*cm, height=8.0*cm, preserveAspectRatio=True, mask='auto')
+
+    # Pie
+    c.setFont("Helvetica-Oblique", 9)
+    c.drawRightString(W-1.5*cm, 1.5*cm, "Generado automáticamente por la app Streamlit — Flujos Multifásicos (GL)")
+
+    c.showPage()
+    c.save()
+    buffer.seek(0)
+    return buffer.read()
+
 # --------- Interfaz Streamlit ---------
 def main():
     st.set_page_config(page_title="Flujos Multifásicos — Segmentación Δp (Gas-Líquido)", layout="wide")
 
-    # ----- Encabezado institucional -----
-    col_logo, col_title = st.columns([1, 3])
+    # ----- Encabezado institucional (sin warning: use_container_width) -----
+    col_logo, col_title = st.columns([1, 3], vertical_alignment="center")
     with col_logo:
-        st.image("logoutn.png", caption=None, use_column_width=True)
+        st.image("logoutn.png", caption=None, use_container_width=True)
     with col_title:
         st.markdown(
             """
             ### Cátedra: **FLUJOS MULTIFÁSICOS EN LA INDUSTRIA DEL PETRÓLEO**  
             **Profesor:** Ezequiel Arturo Krumrick  
             **Año:** 2025
-            """,
+            """
         )
 
     st.title("Modelo 1D segmentado con criterios de corte (Gas–Líquido)")
 
     # ----- Introducción / Importancia -----
     st.markdown(
-        r"""
-**Introducción.** En líneas multifásicas, la **caída de presión** impacta el **patrón de flujo**, el **holdup**, la
-**capacidad de transporte**, la **operabilidad** (slugging, inestabilidades) y el **ASEGURAMIENTO DE FLUJO** (wax/hydrates).  
-Una disminución rápida de \(p\) **expande el gas** (\(Q_G\propto 1/p\)), cambiando \(v_{SG}\) y pudiendo
-desencadenar **cambios de régimen** (estratificado → ondulado → intermitente, etc.).  
-Dimensionar por **tramos admisibles** acota la variación local de \(p\) y \(v_{SG}\), mitigando transiciones bruscas.
-
-**Modelo.** Consideramos ducto **horizontal** (sin elevación), régimen cuasi-estacionario y **gas ideal isotermo** (\(z=1\)).  
-El gradiente friccional por Darcy–Weisbach:
-\[
-g \;\equiv\; \left(\frac{dp}{dx}\right)_f = \frac{2 f\,\rho_M\,v_M^2}{D},\qquad
-v_M=v_{SL}+v_{SG},\quad \rho_M=H_L\rho_L + (1-H_L)\rho_G
-\]
-con \(f\) calculado con **Churchill** (fórmula unificada) y propiedades de mezcla simples.
-
-**Criterios de corte por tramo** (límite inicial \(p_i\)):
-\[
-\Delta x_{\Delta p}=\frac{\gamma_p\, p_i}{g},\qquad
-\Delta x_{\Delta v}=\max\big\{\Delta x:\; |\Delta v_{SG}|/v_{SG}\le \gamma_v\big\}
-\]
-donde \(\gamma_p\) (por ej. 3%) limita \(\Delta p/p\), y \(\gamma_v\) (por ej. 5%) limita la **variación relativa de \(v_{SG}\)**.
-Para gas ideal isotermo, \(Q_G \propto 1/p\Rightarrow v_{SG}\propto 1/p\), de modo que
-\[
-p(x) \approx p_i - g\,\Delta x \;\Rightarrow\; v_{SG}(x) \propto \frac{1}{p_i - g\,\Delta x}.
-\]
-La \(\Delta x_{\Delta v}\) la calculamos por **búsqueda de bisección**.  
-El tramo efectivo es:
-\[
-\boxed{\;\Delta x = \min\big(L_{\text{restante}},\; s \cdot \min\{\Delta x_{\Delta p},\Delta x_{\Delta v}\}\big)\;}
-\]
-con \(s\) **factor de seguridad** (p.ej. 0.95). Integramos \(p\) por **Euler**:
-\[
-p_{i+1} = p_i - g\,\Delta x.
-\]
         """
+**Introducción.** En líneas multifásicas, la **caída de presión** impacta el **patrón de flujo**, el **holdup**, la
+**capacidad de transporte**, la **operabilidad** (slugging, inestabilidades) y el **aseguramiento de flujo** (wax/hydrates).
+Una disminución rápida de presión **expande el gas** (\\(Q_G\\propto 1/p\\)), elevando \\(v_{SG}\\) y pudiendo
+desencadenar **cambios de régimen** (estratificado → ondulado → intermitente, etc.).  
+Dimensionar por **tramos admisibles** acota la variación local de \\(p\\) y de \\(v_{SG}\\), mitigando transiciones bruscas.
+"""
     )
+
+    st.markdown("**Modelo y fórmulas clave**")
+    st.latex(r"g \equiv \left(\frac{dp}{dx}\right)_f = \frac{2\,f\,\rho_M\,v_M^2}{D},\quad v_M=v_{SL}+v_{SG},\quad \rho_M=H_L\rho_L+(1-H_L)\rho_G")
+    st.latex(r"\Delta x_{\Delta p} = \frac{\gamma_p\,p_i}{g}")
+    st.latex(r"\text{Con gas ideal isotermo: } Q_G \propto \frac{1}{p}\Rightarrow v_{SG}\propto \frac{1}{p}")
+    st.latex(r"p(x)\approx p_i - g\,\Delta x \;\Rightarrow\; v_{SG}(x)\propto \frac{1}{p_i-g\,\Delta x}")
+    st.latex(r"\Delta x = \min\big(L_{\text{restante}},\, s\cdot\min\{\Delta x_{\Delta p},\,\Delta x_{\Delta v}\}\big),\qquad p_{i+1}=p_i-g\,\Delta x")
 
     # ----- Datos de entrada (sidebar) -----
     with st.sidebar:
@@ -254,14 +298,9 @@ p_{i+1} = p_i - g\,\Delta x.
     with st.expander("¿Qué datos entrega esta aplicación? (salidas y significado)"):
         st.markdown(
             """
-- **Por tramo**:  
-  - `x0, x1, dx`: posición inicial/final y longitud del tramo.  
-  - `dx_p_lim`, `dx_v_lim`: **longitudes admisibles** por criterio de **Δp/p** y **ΔvSG/vSG**.  
-  - `limit`: criterio que **limitó** el tramo efectivo.  
-  - `Pin, Pout, dp, dp/p`: presión de entrada/salida, caída y % relativo.  
-  - `vSG_in, vSG_out, ΔvSG/vSG`: velocidad superficial de gas y su variación.  
-  - `HL, ρG, ρM, μM, Re, f_Darcy, g`: propiedades y parámetros de fricción.  
-- **Global**: número de tramos, **Δp total** y gráficos \(p(x)\), \(v_{SG}(x)\).
+- **Por tramo**: `x0, x1, dx`, `dx_p_lim`, `dx_v_lim`, `limit`, `Pin, Pout, dp, dp/p`,
+  `vSG_in, vSG_out, ΔvSG/vSG`, `HL, ρG, ρM, μM, Re, f_Darcy, g`.  
+- **Global**: número de tramos, **Δp total** y gráficos \\(p(x)\\) y \\(v_{SG}(x)\\).
             """
         )
 
@@ -269,18 +308,41 @@ p_{i+1} = p_i - g\,\Delta x.
     st.subheader("Resultados por tramo")
     st.dataframe(df, use_container_width=True, height=430)
 
+    fig = None
     if not df.empty:
-        c1, c2 = st.columns(2)
-        with c1:
-            st.markdown("**Perfil de presión**")
-            st.line_chart(df.set_index("x1[m]")[["Pout[bar]"]], height=260)
-        with c2:
-            st.markdown("**Evolución de vSG**")
-            st.line_chart(df.set_index("x1[m]")[["vSG_out[m/s]"]], height=260)
+        # Gráfico P vs L
+        fig = make_pressure_plot(df)
+        st.pyplot(fig, clear_figure=False)
 
-        st.caption(f"Tramos: {len(df)} | Δp total ≈ {df['dp[bar]'].sum():.2f} bar")
-        st.download_button("Descargar resultados (CSV)", df.to_csv(index=False).encode(),
-                           file_name="resultados_tramos.csv", mime="text/csv")
+        ntramos = len(df)
+        dptot_bar = float(df["dp[bar]"].sum())
+        pin_bar = float(df.iloc[0]["Pin[bar]"])
+        pout_bar = float(df.iloc[-1]["Pout[bar]"])
+        st.caption(f"Tramos: {ntramos} | Δp total ≈ {dptot_bar:.2f} bar | P_out ≈ {pout_bar:.2f} bar")
+
+        # Botón de descarga de CSV
+        st.download_button("Descargar resultados (CSV)",
+                           df.to_csv(index=False).encode(),
+                           file_name="resultados_tramos.csv",
+                           mime="text/csv")
+
+        # ----- Reporte PDF -----
+        st.subheader("Exportar reporte PDF")
+        meta = {
+            "logo_path": "logoutn.png",
+            "titulo": "FLUJOS MULTIFÁSICOS — Modelo 1D segmentado (Gas–Líquido)",
+            "catedra": "FLUJOS MULTIFÁSICOS EN LA INDUSTRIA DEL PETRÓLEO",
+            "profesor": "Ezequiel Arturo Krumrick",
+            "anio": "2025",
+            "pin_bar": pin_bar,
+            "pout_bar": pout_bar,
+            "dptot_bar": dptot_bar,
+            "ntramos": ntramos
+        }
+        pdf_bytes = build_pdf(df, fig, meta)
+        st.download_button("Descargar reporte (PDF)", data=pdf_bytes,
+                           file_name=f"Reporte_FlujosMultifasicos_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf",
+                           mime="application/pdf")
 
 if __name__ == "__main__":
     main()
